@@ -175,7 +175,7 @@ func (sf *Server) handleAssociate(ctx context.Context, writer io.Writer, request
 			return net.Dial(net_, addr)
 		}
 	}
-	bindLn, err := net.ListenUDP("udp", nil)
+	bindLn, err := net.ListenUDP("udp4", nil)
 	if err != nil {
 		if err := SendReply(writer, statute.RepServerFailure, nil); err != nil {
 			return fmt.Errorf("failed to send reply, %v", err)

@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/things-go/go-socks5/statute"
 )
@@ -146,11 +147,18 @@ func (sf *Server) handleConnect(ctx context.Context, writer io.Writer, request *
 	errCh := make(chan error, 2)
 	sf.goFunc(func() { errCh <- sf.Proxy(target, request.Reader) })
 	sf.goFunc(func() { errCh <- sf.Proxy(writer, target) })
-	// Wait for either direction to finish, then close target to unblock the
-	// other goroutine. Without this, a clean EOF from the client leaves the
-	// upstream-read goroutine blocked indefinitely on a healthy connection.
+	// Wait for either direction to finish.
 	<-errCh
+	// Close target so the upstream-reading goroutine unblocks when the client
+	// disconnects, and vice versa.
 	target.Close()
+	// When the upstream half closes first, the client-reading goroutine blocks
+	// waiting for the browser's keep-alive timeout (60–300 s). Set an immediate
+	// deadline on the client connection to drain it without waiting.
+	type deadliner interface{ SetDeadline(time.Time) error }
+	if c, ok := writer.(deadliner); ok {
+		_ = c.SetDeadline(time.Now())
+	}
 	<-errCh
 	return nil
 }

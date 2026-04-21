@@ -146,14 +146,12 @@ func (sf *Server) handleConnect(ctx context.Context, writer io.Writer, request *
 	errCh := make(chan error, 2)
 	sf.goFunc(func() { errCh <- sf.Proxy(target, request.Reader) })
 	sf.goFunc(func() { errCh <- sf.Proxy(writer, target) })
-	// Wait
-	for i := 0; i < 2; i++ {
-		e := <-errCh
-		if e != nil {
-			// return from this function closes target (and conn).
-			return e
-		}
-	}
+	// Wait for either direction to finish, then close target to unblock the
+	// other goroutine. Without this, a clean EOF from the client leaves the
+	// upstream-read goroutine blocked indefinitely on a healthy connection.
+	<-errCh
+	target.Close()
+	<-errCh
 	return nil
 }
 

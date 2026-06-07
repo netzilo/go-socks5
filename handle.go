@@ -181,7 +181,9 @@ func (sf *Server) handleAssociate(ctx context.Context, writer io.Writer, request
 			return net.Dial(net_, addr)
 		}
 	}
-	bindLn, err := net.ListenUDP("udp4", nil)
+	// Bind to all interfaces so the relay accepts datagrams from any client,
+	// including non-loopback ones.
+	bindLn, err := net.ListenUDP("udp4", &net.UDPAddr{Port: 0})
 	if err != nil {
 		if err := SendReply(writer, statute.RepServerFailure, nil); err != nil {
 			return fmt.Errorf("failed to send reply, %v", err)
@@ -189,9 +191,25 @@ func (sf *Server) handleAssociate(ctx context.Context, writer io.Writer, request
 		return fmt.Errorf("listen udp failed, %v", err)
 	}
 
-	sf.logger.Errorf("client want to used addr %v, listen addr: %s", request.DestAddr, bindLn.LocalAddr())
+	// RFC 1928 §6: BND.ADDR must be the address the client should send UDP
+	// datagrams to — not the UDP socket's bind address (0.0.0.0), which many
+	// clients use verbatim, causing them to send to the unspecified address.
+	// Derive the correct IP from the TCP control connection's local address so
+	// that loopback clients get 127.0.0.1 and remote clients get the right
+	// interface IP.  Fall back to 127.0.0.1 if the assertion fails.
+	replyAddr := net.Addr(bindLn.LocalAddr())
+	if conn, ok := writer.(net.Conn); ok {
+		if tcpAddr, ok := conn.LocalAddr().(*net.TCPAddr); ok && tcpAddr != nil {
+			_, portStr, _ := net.SplitHostPort(bindLn.LocalAddr().String())
+			port := 0
+			fmt.Sscanf(portStr, "%d", &port)
+			replyAddr = &net.UDPAddr{IP: tcpAddr.IP, Port: port}
+		}
+	}
+	sf.logger.Errorf("UDP ASSOCIATE relay: client=%v bind=%s reply=%s",
+		request.DestAddr, bindLn.LocalAddr(), replyAddr)
 	// send BND.ADDR and BND.PORT, client used
-	if err = SendReply(writer, statute.RepSuccess, bindLn.LocalAddr()); err != nil {
+	if err = SendReply(writer, statute.RepSuccess, replyAddr); err != nil {
 		return fmt.Errorf("failed to send reply, %v", err)
 	}
 

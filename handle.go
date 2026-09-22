@@ -129,16 +129,12 @@ func (sf *Server) handleConnect(ctx context.Context, writer io.Writer, request *
 	var target net.Conn
 	var err error
 	for i, addr := range addrs {
-		attemptCtx, cancel := ctx, context.CancelFunc(func() {})
-		if i < len(addrs)-1 && sf.dialAttemptTimeout > 0 {
-			attemptCtx, cancel = context.WithTimeout(ctx, sf.dialAttemptTimeout)
-		}
-		target, err = sf.dialOne(attemptCtx, "tcp", addr, request)
-		cancel()
+		last := i == len(addrs)-1
+		target, err = sf.dialBounded(ctx, "tcp", addr, request, !last)
 		if err == nil {
 			break
 		}
-		if i < len(addrs)-1 {
+		if !last {
 			sf.logger.Errorf("connect to %s failed (candidate %d/%d), %v; trying next", addr, i+1, len(addrs), err)
 		}
 	}
@@ -153,7 +149,7 @@ func (sf *Server) handleConnect(ctx context.Context, writer io.Writer, request *
 		if err := SendReply(writer, resp, nil); err != nil {
 			return fmt.Errorf("failed to send reply, %v", err)
 		}
-		return fmt.Errorf("connect to %v failed, %v", request.RawDestAddr, err)
+		return fmt.Errorf("connect to %v failed after %d candidate(s), %v", request.RawDestAddr, len(addrs), err)
 	}
 	defer target.Close()
 
@@ -196,6 +192,47 @@ func (sf *Server) connectCandidates(request *Request) []string {
 		addrs = append(addrs, net.JoinHostPort(ip.String(), port))
 	}
 	return addrs
+}
+
+// dialBounded runs dialOne with the caller's own context. When bounded, the
+// attempt is abandoned after dialAttemptTimeout so the next candidate can be
+// tried — but the context given to the dialer is never cancelled or given a
+// deadline. Dialers may keep using it after returning (a MITM wrapper, for
+// instance, returns a pipe and connects upstream asynchronously), so bounding
+// via context would tear down a connection that already succeeded. A dial
+// that completes after being abandoned is closed.
+func (sf *Server) dialBounded(ctx context.Context, network, addr string, request *Request, bounded bool) (net.Conn, error) {
+	if !bounded || sf.dialAttemptTimeout <= 0 {
+		return sf.dialOne(ctx, network, addr, request)
+	}
+
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		conn, err := sf.dialOne(ctx, network, addr, request)
+		ch <- result{conn, err}
+	}()
+
+	timer := time.NewTimer(sf.dialAttemptTimeout)
+	defer timer.Stop()
+	closeLate := func() {
+		if r := <-ch; r.conn != nil {
+			r.conn.Close()
+		}
+	}
+	select {
+	case r := <-ch:
+		return r.conn, r.err
+	case <-timer.C:
+		go closeLate()
+		return nil, fmt.Errorf("dial %s: no answer within %s", addr, sf.dialAttemptTimeout)
+	case <-ctx.Done():
+		go closeLate()
+		return nil, ctx.Err()
+	}
 }
 
 // dialOne performs a single outbound dial using the configured dial hooks.

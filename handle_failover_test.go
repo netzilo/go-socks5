@@ -215,11 +215,13 @@ func TestRequest_Connect_FQDN_AttemptTimeoutBoundsHangingCandidate(t *testing.T)
 	target := startPingPong(t)
 	blackhole := net.ParseIP("10.255.255.1")
 
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
 	rd := &recordingDial{fn: func(ctx context.Context, addr string) (net.Conn, error) {
 		host, _, _ := net.SplitHostPort(addr)
 		if host == blackhole.String() {
-			<-ctx.Done() // hang until the attempt context expires
-			return nil, ctx.Err()
+			<-release // black hole: never answers while the test runs
+			return nil, errors.New("abandoned")
 		}
 		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	}}
@@ -235,6 +237,84 @@ func TestRequest_Connect_FQDN_AttemptTimeoutBoundsHangingCandidate(t *testing.T)
 	require.GreaterOrEqual(t, elapsed, attempt, "first candidate should have consumed the attempt budget")
 	require.Less(t, elapsed, 10*attempt, "hanging candidate must not block beyond the attempt timeout")
 	require.Len(t, rd.attempted(), 2)
+}
+
+// A dialer may return a connection immediately and keep using ctx afterwards
+// (the MITM wrapper returns a pipe and dials upstream asynchronously). The
+// context handed to the winning attempt must therefore stay live: no deadline,
+// not cancelled — even though the attempt was not the last candidate.
+func TestRequest_Connect_FQDN_WinnerContextStaysLive(t *testing.T) {
+	const attempt = 30 * time.Millisecond
+	ips := []net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("192.0.2.2")}
+
+	type probe struct {
+		hadDeadline bool
+		errAfter    error
+	}
+	probeCh := make(chan probe, 1)
+	dial := func(ctx context.Context, _ string, _ string) (net.Conn, error) {
+		clientSide, serverSide := net.Pipe()
+		go func() {
+			// Serve ping/pong like an upstream would, but only after the attempt
+			// window has long expired — if ctx were bounded it would be dead now.
+			time.Sleep(4 * attempt)
+			_, hadDeadline := ctx.Deadline()
+			probeCh <- probe{hadDeadline: hadDeadline, errAfter: ctx.Err()}
+			buf := make([]byte, 4)
+			if _, err := io.ReadFull(clientSide, buf); err == nil {
+				clientSide.Write([]byte("pong")) //nolint: errcheck
+			}
+			clientSide.Close()
+		}()
+		return &tcpAddrPipe{Conn: serverSide}, nil
+	}
+	srv := newTestServer(multiResolver{ips: ips}, dial, attempt)
+
+	out, _, err := runConnect(t, srv, fqdnConnectRequest("travel.example", 443), true)
+	require.NoError(t, err)
+	requireSuccessReplyWithPong(t, out)
+	p := <-probeCh
+	require.False(t, p.hadDeadline, "winning attempt's ctx must carry no deadline")
+	require.NoError(t, p.errAfter, "winning attempt's ctx must not be cancelled after the dial returns")
+}
+
+// tcpAddrPipe gives a net.Pipe end a *net.TCPAddr LocalAddr so SendReply can
+// encode the SOCKS5 success reply (mirrors the MITM wrapper's shim).
+type tcpAddrPipe struct{ net.Conn }
+
+func (c *tcpAddrPipe) LocalAddr() net.Addr  { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+func (c *tcpAddrPipe) RemoteAddr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)} }
+
+// An attempt that completes after it was abandoned must have its connection
+// closed rather than leaked, and the next candidate must have been used.
+func TestRequest_Connect_FQDN_LateSuccessIsClosed(t *testing.T) {
+	target := startPingPong(t)
+	const attempt = 40 * time.Millisecond
+	slow := net.ParseIP("192.0.2.1")
+
+	lateEnd := make(chan net.Conn, 1)
+	rd := &recordingDial{fn: func(ctx context.Context, addr string) (net.Conn, error) {
+		host, _, _ := net.SplitHostPort(addr)
+		if host == slow.String() {
+			time.Sleep(4 * attempt) // answers, but far too late
+			a, b := net.Pipe()
+			lateEnd <- b
+			return a, nil
+		}
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}}
+	srv := newTestServer(multiResolver{ips: []net.IP{slow, target.IP}}, rd.dial, attempt)
+
+	out, _, err := runConnect(t, srv, fqdnConnectRequest("travel.example", target.Port), true)
+	require.NoError(t, err)
+	requireSuccessReplyWithPong(t, out)
+	require.Len(t, rd.attempted(), 2)
+
+	// The abandoned attempt's connection must be closed by the server.
+	other := <-lateEnd
+	other.SetReadDeadline(time.Now().Add(2 * time.Second)) //nolint: errcheck
+	_, rerr := other.Read(make([]byte, 1))
+	require.ErrorIs(t, rerr, io.EOF, "late connection must be closed, not leaked")
 }
 
 // The last candidate must not be bounded by the attempt timeout: a slow but

@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"time"
 
 	"github.com/things-go/go-socks5/bufferpool"
 )
@@ -94,6 +95,16 @@ func WithDialAndRequest(
 ) Option {
 	return func(s *Server) {
 		s.dialWithRequest = dial
+	}
+}
+
+// WithDialAttemptTimeout bounds each individual CONNECT attempt when the
+// resolver returned several candidate addresses (see MultiNameResolver). The
+// last candidate is always dialed with the request's full context so a slow
+// but reachable destination is not cut off. Zero disables the bound.
+func WithDialAttemptTimeout(d time.Duration) Option {
+	return func(s *Server) {
+		s.dialAttemptTimeout = d
 	}
 }
 

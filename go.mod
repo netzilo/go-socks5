@@ -4,6 +4,7 @@ go 1.18
 
 require (
 	github.com/stretchr/testify v1.9.0
+	github.com/things-go/go-socks5 v0.0.4
 	golang.org/x/net v0.26.0
 )
 

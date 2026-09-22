@@ -61,16 +61,13 @@ func TestRequest_Connect(t *testing.T) {
 	// Send a ping
 	buf.WriteString("ping")
 
-	// Handle the request
-	rsp := new(MockConn)
-	req, err := ParseRequest(buf)
-	require.NoError(t, err)
-
-	err = proxySrv.handleRequest(rsp, req)
+	// Handle the request. The client side must stay open until "pong" has
+	// been relayed: the server closes the target as soon as the client->target
+	// direction finishes, so a plain bytes.Buffer (instant EOF) races the reply.
+	out, _, err := runConnect(t, proxySrv, buf, true)
 	require.NoError(t, err)
 
 	// Verify response
-	out := rsp.buf.Bytes()
 	expected := []byte{
 		statute.VersionSocks5, statute.RepSuccess, 0,
 		statute.ATYPIPv4, 127, 0, 0, 1, 0, 0,

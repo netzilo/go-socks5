@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,9 @@ type Request struct {
 	Reader io.Reader
 	// RawDestAddr of the desired destination
 	RawDestAddr *statute.AddrSpec
+	// Candidates holds every address the resolver returned for RawDestAddr.FQDN,
+	// in attempt order. Empty for literal-IP requests or single-IP resolvers.
+	Candidates []net.IP
 }
 
 // ParseRequest creates a new Request from the tcp connection
@@ -56,7 +60,19 @@ func (sf *Server) handleRequest(write io.Writer, req *Request) error {
 	// Resolve the address if we have a FQDN
 	dest := req.RawDestAddr
 	if dest.FQDN != "" {
-		ctx, dest.IP, err = sf.resolver.Resolve(ctx, dest.FQDN)
+		if mr, ok := sf.resolver.(MultiNameResolver); ok {
+			var ips []net.IP
+			ctx, ips, err = mr.ResolveAll(ctx, dest.FQDN)
+			if err == nil && len(ips) == 0 {
+				err = errors.New("resolver returned no addresses")
+			}
+			if err == nil {
+				req.Candidates = ips
+				dest.IP = ips[0]
+			}
+		} else {
+			ctx, dest.IP, err = sf.resolver.Resolve(ctx, dest.FQDN)
+		}
 		if err != nil {
 			if err := SendReply(write, statute.RepHostUnreachable, nil); err != nil {
 				return fmt.Errorf("failed to send reply, %v", err)
@@ -108,20 +124,23 @@ func (sf *Server) handleRequest(write io.Writer, req *Request) error {
 
 // handleConnect is used to handle a connect command
 func (sf *Server) handleConnect(ctx context.Context, writer io.Writer, request *Request) error {
-	// Attempt to connect
+	// Attempt to connect, failing over across resolver candidates when present.
+	addrs := sf.connectCandidates(request)
 	var target net.Conn
 	var err error
-
-	if sf.dialWithRequest != nil {
-		target, err = sf.dialWithRequest(ctx, "tcp", request.DestAddr.String(), request)
-	} else {
-		dial := sf.dial
-		if dial == nil {
-			dial = func(ctx context.Context, net_, addr string) (net.Conn, error) {
-				return net.Dial(net_, addr)
-			}
+	for i, addr := range addrs {
+		attemptCtx, cancel := ctx, context.CancelFunc(func() {})
+		if i < len(addrs)-1 && sf.dialAttemptTimeout > 0 {
+			attemptCtx, cancel = context.WithTimeout(ctx, sf.dialAttemptTimeout)
 		}
-		target, err = dial(ctx, "tcp", request.DestAddr.String())
+		target, err = sf.dialOne(attemptCtx, "tcp", addr, request)
+		cancel()
+		if err == nil {
+			break
+		}
+		if i < len(addrs)-1 {
+			sf.logger.Errorf("connect to %s failed (candidate %d/%d), %v; trying next", addr, i+1, len(addrs), err)
+		}
 	}
 	if err != nil {
 		msg := err.Error()
@@ -161,6 +180,33 @@ func (sf *Server) handleConnect(ctx context.Context, writer io.Writer, request *
 	}
 	<-errCh
 	return nil
+}
+
+// connectCandidates returns the ordered list of "ip:port" targets for a CONNECT.
+// Resolver candidates are only used when the destination was not rewritten;
+// otherwise the (possibly rewritten) DestAddr is the single target.
+func (sf *Server) connectCandidates(request *Request) []string {
+	dest := request.DestAddr
+	if len(request.Candidates) < 2 || dest == nil || len(dest.IP) == 0 || !dest.IP.Equal(request.Candidates[0]) {
+		return []string{dest.String()}
+	}
+	port := strconv.Itoa(dest.Port)
+	addrs := make([]string, 0, len(request.Candidates))
+	for _, ip := range request.Candidates {
+		addrs = append(addrs, net.JoinHostPort(ip.String(), port))
+	}
+	return addrs
+}
+
+// dialOne performs a single outbound dial using the configured dial hooks.
+func (sf *Server) dialOne(ctx context.Context, network, addr string, request *Request) (net.Conn, error) {
+	if sf.dialWithRequest != nil {
+		return sf.dialWithRequest(ctx, network, addr, request)
+	}
+	if sf.dial != nil {
+		return sf.dial(ctx, network, addr)
+	}
+	return (&net.Dialer{}).DialContext(ctx, network, addr)
 }
 
 // handleBind is used to handle a connect command

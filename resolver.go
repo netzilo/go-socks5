@@ -10,6 +10,14 @@ type NameResolver interface {
 	Resolve(ctx context.Context, name string) (context.Context, net.IP, error)
 }
 
+// MultiNameResolver may optionally be implemented by a NameResolver to return
+// every address for a name, in the order they should be attempted. When the
+// configured resolver implements it, CONNECT requests fail over between the
+// returned addresses instead of committing to a single one.
+type MultiNameResolver interface {
+	ResolveAll(ctx context.Context, name string) (context.Context, []net.IP, error)
+}
+
 // DNSResolver uses the system DNS to resolve host names
 type DNSResolver struct{}
 
